@@ -1,3 +1,4 @@
+use async_trait::async_trait;
 use chrono::prelude::*;
 use clap::Parser;
 use std::io::{Error, ErrorKind};
@@ -19,6 +20,7 @@ struct Opts {
 ///
 /// A trait to provide a common interface for all signal calculations.
 ///
+#[async_trait]
 trait AsyncStockSignal {
     ///
     /// The signal's data type.
@@ -32,32 +34,35 @@ trait AsyncStockSignal {
     ///
     /// The signal (using the provided type) or `None` on error/invalid data.
     ///
-    fn calculate(&self, series: &[f64]) -> Option<Self::SignalType>;
+    async fn calculate(&self, series: &[f64]) -> Option<Self::SignalType>;
 }
 
 struct PriceDifference;
+#[async_trait]
 impl AsyncStockSignal for PriceDifference {
     type SignalType = (f64, f64);
 
-    fn calculate(&self, series: &[f64]) -> Option<Self::SignalType> {
+    async fn calculate(&self, series: &[f64]) -> Option<Self::SignalType> {
         price_diff(series)
     }
 }
 
 struct MinPrice;
+#[async_trait]
 impl AsyncStockSignal for MinPrice {
     type SignalType = f64;
 
-    fn calculate(&self, series: &[f64]) -> Option<Self::SignalType> {
+    async fn calculate(&self, series: &[f64]) -> Option<Self::SignalType> {
         min(series)
     }
 }
 
 struct MaxPrice;
+#[async_trait]
 impl AsyncStockSignal for MaxPrice {
     type SignalType = f64;
 
-    fn calculate(&self, series: &[f64]) -> Option<Self::SignalType> {
+    async fn calculate(&self, series: &[f64]) -> Option<Self::SignalType> {
         max(series)
     }
 }
@@ -65,10 +70,11 @@ impl AsyncStockSignal for MaxPrice {
 struct WindowedSMA {
     window_size: usize,
 }
+#[async_trait]
 impl AsyncStockSignal for WindowedSMA {
     type SignalType = Vec<f64>;
 
-    fn calculate(&self, series: &[f64]) -> Option<Self::SignalType> {
+    async fn calculate(&self, series: &[f64]) -> Option<Self::SignalType> {
         n_window_sma(self.window_size, series)
     }
 }
@@ -133,7 +139,7 @@ fn min(series: &[f64]) -> Option<f64> {
 ///
 /// Retrieve data from a data source and extract the closing prices. Errors during download are mapped onto io::Errors as InvalidData.
 ///
-fn fetch_closing_data(
+async fn fetch_closing_data(
     symbol: &str,
     beginning: &DateTime<Utc>,
     end: &DateTime<Utc>,
@@ -142,19 +148,21 @@ fn fetch_closing_data(
 
     let response = provider
         .get_quote_history(symbol, *beginning, *end)
+        .await
         .map_err(|_| Error::from(ErrorKind::InvalidData))?;
     let mut quotes = response
         .quotes()
         .map_err(|_| Error::from(ErrorKind::InvalidData))?;
     if !quotes.is_empty() {
         quotes.sort_by_cached_key(|k| k.timestamp);
-        Ok(quotes.iter().map(|q| q.adjclose as f64).collect())
+        Ok(quotes.iter().map(|q| q.adjclose).collect())
     } else {
         Ok(vec![])
     }
 }
 
-fn main() -> std::io::Result<()> {
+#[async_std::main]
+async fn main() -> std::io::Result<()> {
     let opts = Opts::parse();
     let from: DateTime<Utc> = opts.from.parse().expect("Couldn't parse 'from' date");
     let to = Utc::now();
@@ -162,7 +170,7 @@ fn main() -> std::io::Result<()> {
     // a simple way to output a CSV header
     println!("period start,symbol,price,change %,min,max,30d avg");
     for symbol in opts.symbols.split(',') {
-        let closes = fetch_closing_data(&symbol, &from, &to)?;
+        let closes = fetch_closing_data(symbol, &from, &to).await?;
         if !closes.is_empty() {
             // min/max of the period. unwrap() because those are Option types
             let period_max: f64 = max(&closes).unwrap();

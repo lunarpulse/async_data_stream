@@ -3,12 +3,15 @@ use async_std::stream::StreamExt;
 use async_trait::async_trait;
 use chrono::prelude::*;
 use clap::Parser;
-use futures::future::join_all;
+use std::fs::File;
+use std::io::BufWriter;
+use std::io::Write;
 use std::iter::Iterator;
 use std::{
     io::{Error, ErrorKind},
     time::Duration,
 };
+use xactor::*;
 use yahoo_finance_api as yahoo;
 
 #[derive(Parser, Debug)]
@@ -132,81 +135,206 @@ impl AsyncStockSignal for MinPrice {
     }
 }
 
-///
-/// Retrieve data from a data source and extract the closing prices. Errors during download are mapped onto io::Errors as InvalidData.
-///
-async fn fetch_closing_data(
-    symbol: &str,
-    beginning: &DateTime<Utc>,
-    end: &DateTime<Utc>,
-) -> std::io::Result<Vec<f64>> {
-    let provider = yahoo::YahooConnector::new();
+#[message]
+#[derive(Debug, Clone)]
+struct QuoteRequest {
+    symbol: String,
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+}
 
-    let response = provider
-        .get_quote_history(symbol, *beginning, *end)
-        .await
-        .map_err(|_| Error::from(ErrorKind::InvalidData))?;
-    let mut quotes = response
-        .quotes()
-        .map_err(|_| Error::from(ErrorKind::InvalidData))?;
-    if !quotes.is_empty() {
-        quotes.sort_by_cached_key(|k| k.timestamp);
-        Ok(quotes.iter().map(|q| q.adjclose).collect())
-    } else {
-        Ok(vec![])
+struct QuoteRequester;
+
+#[async_trait::async_trait]
+impl Handler<QuoteRequest> for QuoteRequester {
+    async fn handle(&mut self, _ctx: &mut Context<Self>, msg: QuoteRequest) {
+        let provider = yahoo::YahooConnector::new();
+
+        let response = provider
+            .get_quote_history(&msg.symbol, msg.from, msg.to)
+            .await
+            .map_err(|_| Error::from(ErrorKind::InvalidData))
+            .expect("No response");
+
+        let quotes = response
+            .quotes()
+            .map_err(|_| Error::from(ErrorKind::InvalidData))
+            .expect("No Qoutes");
+
+        let data = Quotes {
+            symbol: msg.symbol,
+            timestamp: msg.from,
+            quotes,
+        };
+        if let Err(e) = Broker::from_registry().await.unwrap().publish(data) {
+            eprint!("{}", e);
+        }
     }
 }
 
-async fn process_symbol_data(
-    symbol: &str,
-    beginning: &DateTime<Utc>,
-    end: &DateTime<Utc>,
-) -> Option<Vec<f64>> {
-    let closes = fetch_closing_data(symbol, beginning, end).await.ok()?;
-    if !closes.is_empty() {
-        let diff = PriceDifference {};
-        let min = MinPrice {};
-        let max = MaxPrice {};
-        let sma = WindowedSMA { window_size: 30 };
+#[async_trait::async_trait]
+impl Actor for QuoteRequester {
+    async fn started(&mut self, ctx: &mut Context<Self>) -> Result<()> {
+        ctx.subscribe::<QuoteRequest>().await
+    }
+}
 
-        let period_max: f64 = max.calculate(&closes).await?;
-        let period_min: f64 = min.calculate(&closes).await?;
+#[message]
+#[derive(Debug, Clone)]
+struct Quotes {
+    pub symbol: String,
+    pub timestamp: DateTime<Utc>,
+    pub quotes: Vec<yahoo::Quote>,
+}
 
-        let last_price = *closes.last()?;
-        let (_, pct_change) = diff.calculate(&closes).await?;
-        let sma = sma.calculate(&closes).await?;
+struct QuoteProcessor;
 
-        // a simple way to output CSV data
-        println!(
-            "{},{},${:.2},{:.2}%,${:.2},${:.2},${:.2}",
-            beginning.to_rfc3339(),
-            symbol,
-            last_price,
-            pct_change * 100.0,
-            period_min,
-            period_max,
-            sma.last().unwrap_or(&0.0)
+#[async_trait::async_trait]
+impl Handler<Quotes> for QuoteProcessor {
+    async fn handle(&mut self, _ctx: &mut Context<Self>, mut msg: Quotes) {
+        let data = if !msg.quotes.is_empty() {
+            msg.quotes.sort_by_cached_key(|k| k.timestamp);
+            msg.quotes.iter().map(|q| q.adjclose).collect()
+        } else {
+            vec![]
+        };
+
+        if !data.is_empty() {
+            let diff = PriceDifference {};
+            let min = MinPrice {};
+            let max = MaxPrice {};
+            let sma = WindowedSMA { window_size: 30 };
+
+            let period_max: f64 = max.calculate(&data).await.expect("none max");
+            let period_min: f64 = min.calculate(&data).await.expect("no min");
+
+            let last_price = *data.last().expect("no last");
+            let (_, pct_change) = diff.calculate(&data).await.expect("no diff");
+            let sma = sma.calculate(&data).await.expect("no sma");
+
+            // a simple way to output CSV data
+            println!(
+                "{},{},${:.2},{:.2}%,${:.2},${:.2},${:.2}",
+                msg.timestamp.to_rfc3339(),
+                msg.symbol,
+                last_price,
+                pct_change * 100.0,
+                period_min,
+                period_max,
+                sma.last().unwrap_or(&0.0)
+            );
+            let data = FileFormat {
+                symbol: msg.symbol,
+                timestamp: msg.timestamp,
+                price: last_price,
+                pct_change,
+                period_min,
+                period_max,
+                last_sma: *sma.last().unwrap(),
+            };
+            if let Err(e) = Broker::from_registry().await.unwrap().publish(data) {
+                eprint!("{}", e);
+            }
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Actor for QuoteProcessor {
+    async fn started(&mut self, ctx: &mut Context<Self>) -> Result<()> {
+        ctx.subscribe::<Quotes>().await
+    }
+}
+
+#[message]
+#[derive(Clone, Debug)]
+struct FileFormat {
+    pub symbol: String,
+    pub timestamp: DateTime<Utc>,
+    pub price: f64,
+    pub pct_change: f64,
+    pub period_min: f64,
+    pub period_max: f64,
+    pub last_sma: f64,
+}
+struct DataPersistor {
+    pub filename: String,
+    pub writer: Option<BufWriter<File>>,
+}
+
+#[async_trait::async_trait]
+impl Handler<FileFormat> for DataPersistor {
+    async fn handle(&mut self, _ctx: &mut Context<Self>, msg: FileFormat) {
+        if let Some(file) = &mut self.writer {
+            let _ = writeln!(
+                file,
+                "{},{},${:.2},{:.2}%,${:.2},${:.2},${:.2}",
+                msg.timestamp.to_rfc3339(),
+                msg.symbol,
+                msg.price,
+                msg.pct_change * 100.0,
+                msg.period_min,
+                msg.period_max,
+                msg.last_sma
+            );
+            let _ = file.flush();
+        } else {
+            return;
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Actor for DataPersistor {
+    async fn started(&mut self, ctx: &mut Context<Self>) -> Result<()> {
+        let mut file = File::create(&self.filename)
+            .unwrap_or_else(|_| panic!("Could not open file '{}'", self.filename));
+        let _ = writeln!(
+            &mut file,
+            "period start,symbol,price,change %,min,max,30d avg"
         );
+        self.writer = Some(BufWriter::new(file));
+        ctx.subscribe::<FileFormat>().await
     }
-    Some(closes)
+
+    async fn stopped(&mut self, ctx: &mut Context<Self>) {
+        if let Some(writer) = &mut self.writer {
+            writer.flush().expect("unable to flush")
+        };
+        ctx.stop(None);
+    }
 }
 
-#[async_std::main]
-async fn main() -> std::io::Result<()> {
+#[xactor::main]
+async fn main() -> Result<()> {
     let opts = Opts::parse();
+    println!("starting");
     let from: DateTime<Utc> = opts.from.parse().expect("Couldn't parse 'from' date");
-    let to = Utc::now();
-
     let mut interval = stream::interval(Duration::from_secs(4));
+    let symbols: Vec<String> = opts.symbols.split(',').map(|s| s.to_owned()).collect();
+
+    let _fetcher = Supervisor::start(|| QuoteRequester).await;
+    let _processor = Supervisor::start(|| QuoteProcessor).await;
+    let _saver = Supervisor::start(|| DataPersistor {
+        filename: format!("{}.csv", Utc::now().to_rfc2822()), // create a unique file name every time
+        writer: None,
+    })
+    .await;
+
+    // CSV header
     println!("period start,symbol,price,change %,min,max,30d avg");
-    let symbols: Vec<&str> = opts.symbols.split(',').collect();
-    while (interval.next().await).is_some() {
-        // a simple way to output a CSV header
-        let queries: Vec<_> = symbols
-            .iter()
-            .map(|&symbol| process_symbol_data(symbol, &from, &to))
-            .collect();
-        let _ = join_all(queries).await;
+    while interval.next().await.is_some() {
+        let now = Utc::now(); // Period end for this fetch
+        for symbol in &symbols {
+            if let Err(e) = Broker::from_registry().await?.publish(QuoteRequest {
+                symbol: symbol.clone(),
+                from,
+                to: now,
+            }) {
+                eprint!("{}", e);
+                break;
+            }
+        }
     }
     Ok(())
 }

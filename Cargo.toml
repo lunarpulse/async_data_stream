@@ -14,3 +14,4 @@ clap = {version = "3.1.8", features = ["derive"]}
 yahoo_finance_api = "1.1"
 futures = "0.3"
 xactor = "0.7.11"
+ctrlc = "3.4.0"

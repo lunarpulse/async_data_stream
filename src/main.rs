@@ -1,3 +1,4 @@
+use async_std::channel;
 use async_std::stream;
 use async_std::stream::StreamExt;
 use async_trait::async_trait;
@@ -7,10 +8,7 @@ use std::fs::File;
 use std::io::BufWriter;
 use std::io::Write;
 use std::iter::Iterator;
-use std::{
-    io::{Error, ErrorKind},
-    time::Duration,
-};
+use std::time::Duration;
 use xactor::*;
 use yahoo_finance_api as yahoo;
 
@@ -25,6 +23,8 @@ struct Opts {
     symbols: String,
     #[clap(short, long)]
     from: String,
+    #[clap(short, long)]
+    interval: String,
 }
 
 ///
@@ -144,27 +144,52 @@ struct QuoteRequest {
 }
 
 struct QuoteRequester;
-
 #[async_trait::async_trait]
 impl Handler<QuoteRequest> for QuoteRequester {
     async fn handle(&mut self, _ctx: &mut Context<Self>, msg: QuoteRequest) {
+        let days = msg
+            .to
+            .naive_utc()
+            .signed_duration_since(msg.from.naive_utc())
+            .num_days() as usize;
         let provider = yahoo::YahooConnector::new();
-
-        let response = provider
+        let data = match provider
             .get_quote_history(&msg.symbol, msg.from, msg.to)
             .await
-            .map_err(|_| Error::from(ErrorKind::InvalidData))
-            .expect("No response");
-
-        let quotes = response
-            .quotes()
-            .map_err(|_| Error::from(ErrorKind::InvalidData))
-            .expect("No Qoutes");
-
-        let data = Quotes {
-            symbol: msg.symbol,
-            timestamp: msg.from,
-            quotes,
+        {
+            Ok(response) => {
+                if let Ok(quotes) = response.quotes() {
+                    Quotes {
+                        days,
+                        symbol: msg.symbol,
+                        timestamp: msg.from,
+                        quotes,
+                    }
+                } else {
+                    Quotes {
+                        days,
+                        symbol: msg.symbol,
+                        timestamp: msg.from,
+                        quotes: vec![],
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("Ignoring API error for symbol '{}': {}", msg.symbol, e);
+                if let Err(e) = Broker::from_registry()
+                    .await
+                    .unwrap()
+                    .publish(RegisteredSignal)
+                {
+                    eprint!("{}", e);
+                };
+                Quotes {
+                    days,
+                    symbol: msg.symbol,
+                    timestamp: msg.from,
+                    quotes: vec![],
+                }
+            }
         };
         if let Err(e) = Broker::from_registry().await.unwrap().publish(data) {
             eprint!("{}", e);
@@ -182,6 +207,7 @@ impl Actor for QuoteRequester {
 #[message]
 #[derive(Debug, Clone)]
 struct Quotes {
+    days: usize,
     pub symbol: String,
     pub timestamp: DateTime<Utc>,
     pub quotes: Vec<yahoo::Quote>,
@@ -203,7 +229,9 @@ impl Handler<Quotes> for QuoteProcessor {
             let diff = PriceDifference {};
             let min = MinPrice {};
             let max = MaxPrice {};
-            let sma = WindowedSMA { window_size: 30 };
+            let sma = WindowedSMA {
+                window_size: msg.days / 2,
+            };
 
             let period_max: f64 = max.calculate(&data).await.expect("none max");
             let period_min: f64 = min.calculate(&data).await.expect("no min");
@@ -221,7 +249,7 @@ impl Handler<Quotes> for QuoteProcessor {
                 pct_change * 100.0,
                 period_min,
                 period_max,
-                sma.last().unwrap_or(&0.0)
+                sma.first().unwrap()
             );
             let data = FileFormat {
                 symbol: msg.symbol,
@@ -230,7 +258,7 @@ impl Handler<Quotes> for QuoteProcessor {
                 pct_change,
                 period_min,
                 period_max,
-                last_sma: *sma.last().unwrap(),
+                last_sma: *sma.first().unwrap(),
             };
             if let Err(e) = Broker::from_registry().await.unwrap().publish(data) {
                 eprint!("{}", e);
@@ -260,8 +288,19 @@ struct FileFormat {
 struct DataPersistor {
     pub filename: String,
     pub writer: Option<BufWriter<File>>,
+    count: i32,
+    days: usize,
 }
-
+impl DataPersistor {
+    fn new(filename: String, days: usize) -> Self {
+        DataPersistor {
+            filename,
+            writer: None,
+            count: 0,
+            days,
+        }
+    }
+}
 #[async_trait::async_trait]
 impl Handler<FileFormat> for DataPersistor {
     async fn handle(&mut self, _ctx: &mut Context<Self>, msg: FileFormat) {
@@ -277,10 +316,21 @@ impl Handler<FileFormat> for DataPersistor {
                 msg.period_max,
                 msg.last_sma
             );
-            let _ = file.flush();
+            if self.count % 23 == 0 {
+                let _ = file.flush();
+            }
+            self.count += 1;
         } else {
             return;
         }
+    }
+}
+
+#[async_trait::async_trait]
+impl Handler<RegisteredSignal> for DataPersistor {
+    async fn handle(&mut self, ctx: &mut Context<Self>, _msg: RegisteredSignal) {
+        println!("RegisteredSignal recieved");
+        ctx.stop(None)
     }
 }
 
@@ -291,7 +341,8 @@ impl Actor for DataPersistor {
             .unwrap_or_else(|_| panic!("Could not open file '{}'", self.filename));
         let _ = writeln!(
             &mut file,
-            "period start,symbol,price,change %,min,max,30d avg"
+            "period start,symbol,price,change %,min,max,{}d avg",
+            self.days
         );
         self.writer = Some(BufWriter::new(file));
         ctx.subscribe::<FileFormat>().await
@@ -305,36 +356,107 @@ impl Actor for DataPersistor {
     }
 }
 
+struct SignalHandler {
+    signal_rx: channel::Receiver<()>,
+}
+
+impl SignalHandler {
+    fn new() -> Self {
+        let (signal_tx, signal_rx) = channel::bounded(100);
+
+        println!("waiting for Signal Ctrl+C .");
+        // Move the sender part into the ctrl-c handler
+        async_std::task::spawn(async move {
+            ctrlc::set_handler(move || {
+                signal_tx.try_send(()).unwrap_or_else(|_| {
+                    println!("Failed to send Ctrl+C event.");
+                });
+            })
+            .expect("Error setting Ctrl+C handler");
+        });
+        SignalHandler { signal_rx }
+    }
+}
+
+#[async_trait::async_trait]
+impl Actor for SignalHandler {
+    async fn started(&mut self, ctx: &mut Context<Self>) -> Result<()> {
+        // Forward the signal Rx stream to the Actor's message queue
+        let _ = self.signal_rx.recv().await.unwrap();
+
+        ctx.send_later(RegisteredSignal, Duration::from_micros(1));
+        if let Err(e) = Broker::from_registry()
+            .await
+            .unwrap()
+            .publish(RegisteredSignal)
+        {
+            eprintln!("{}", e)
+        }
+        println!("SignalHandler:: Signal RegisteredSignal sending.");
+        Ok(())
+    }
+}
+
+#[message]
+#[derive(Clone, Debug)]
+struct RegisteredSignal;
+
+#[async_trait::async_trait]
+impl Handler<RegisteredSignal> for SignalHandler {
+    async fn handle(&mut self, ctx: &mut Context<Self>, _msg: RegisteredSignal) {
+        println!("Signal handler::RegisteredSignal received RegisteredSignal message. exiting");
+        // Implement behavior you want to execute when the signal is detected
+        ctx.stop(None);
+    }
+}
+
 #[xactor::main]
 async fn main() -> Result<()> {
     let opts = Opts::parse();
     println!("starting");
-    let from: DateTime<Utc> = opts.from.parse().expect("Couldn't parse 'from' date");
+    let mut from: DateTime<Utc> = opts.from.parse().expect("Couldn't parse 'from' date");
+    let time_interval = chrono::Duration::days(
+        opts.interval
+            .parse()
+            .expect("Couldn;t parse 'interval' hours"),
+    );
+    let days = time_interval;
     let mut interval = stream::interval(Duration::from_secs(4));
     let symbols: Vec<String> = opts.symbols.split(',').map(|s| s.to_owned()).collect();
-
     let _fetcher = Supervisor::start(|| QuoteRequester).await;
     let _processor = Supervisor::start(|| QuoteProcessor).await;
-    let _saver = Supervisor::start(|| DataPersistor {
-        filename: format!("{}.csv", Utc::now().to_rfc2822()), // create a unique file name every time
-        writer: None,
+    let _saver = Supervisor::start(move || {
+        DataPersistor::new(
+            format!("{}.csv", Utc::now().to_rfc2822()),
+            days.num_days() as usize,
+        )
     })
     .await;
-
+    // let signal_handler = SignalHandler::new();
+    // let sh_addr = signal_handler.start().await?;
+    // sh_addr.wait_for_stop().await;
+    // let _signhandler = Supervisor::start(SignalHandler::new).await;
     // CSV header
-    println!("period start,symbol,price,change %,min,max,30d avg");
+    println!(
+        "period start,symbol,price,change %,min,max,{}d avg",
+        time_interval.num_days() as usize
+    );
     while interval.next().await.is_some() {
-        let now = Utc::now(); // Period end for this fetch
+        // let now = Utc::now(); // Period end for this fetch
+        // let days = chrono::Duration::days(30);
+        let to: DateTime<Utc> = from + time_interval;
+
         for symbol in &symbols {
             if let Err(e) = Broker::from_registry().await?.publish(QuoteRequest {
                 symbol: symbol.clone(),
                 from,
-                to: now,
+                to,
             }) {
                 eprint!("{}", e);
                 break;
             }
         }
+        from = to;
     }
     Ok(())
 }

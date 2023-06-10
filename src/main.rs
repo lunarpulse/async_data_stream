@@ -501,12 +501,12 @@ async fn main() -> Result<()> {
         let to: DateTime<Utc> = from + time_interval;
 
         for symbol in &symbols {
-            if let Err(e) = quote_requester_addr.send(QuoteRequest {
+            if let Err(_e) = quote_requester_addr.send(QuoteRequest {
                 symbol: symbol.clone(),
                 from,
                 to,
             }) {
-                eprint!("{}", e);
+                // eprint!("{}", e);
                 stopped = true;
             }
         }

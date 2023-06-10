@@ -57,7 +57,7 @@ impl Handler<RegisteredSignal> for DataPersistor {
 
 #[async_trait::async_trait]
 impl Actor for DataPersistor {
-    async fn started(&mut self, _ctx: &mut Context<Self>) -> Result<()> {
+    async fn started(&mut self, ctx: &mut Context<Self>) -> Result<()> {
         let mut file = File::create(&self.filename)
             .unwrap_or_else(|_| panic!("Could not open file '{}'", self.filename));
         let _ = writeln!(
@@ -66,7 +66,7 @@ impl Actor for DataPersistor {
             self.days
         );
         self.writer = Some(BufWriter::new(file));
-        Ok(())
+        ctx.subscribe::<RegisteredSignal>().await
     }
 
     async fn stopped(&mut self, ctx: &mut Context<Self>) {

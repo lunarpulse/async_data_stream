@@ -1,13 +1,11 @@
 use xactor::*;
 use yahoo_finance_api as yahoo;
 
-use super::{
-    common::{QuoteRequest, Quotes, RegisteredSignal},
-    quote_processor::QuoteProcessor,
-};
+use super::common::{QuoteRequest, Quotes, RegisteredSignal};
 
 pub struct QuoteRequester {
-    pub quote_processor_addr: Addr<QuoteProcessor>,
+    /*     pub quote_processor_addr: Addr<QuoteProcessor>,
+     */
 }
 
 #[async_trait::async_trait]
@@ -51,7 +49,10 @@ impl Handler<QuoteRequest> for QuoteRequester {
                 }
             }
         };
-        if let Err(e) = self.quote_processor_addr.send(data) {
+        /*         if let Err(e) = self.quote_processor_addr.send(data) {
+            eprint!("{}", e);
+        } */
+        if let Err(e) = Broker::from_registry().await.unwrap().publish(data) {
             eprint!("{}", e);
         }
     }

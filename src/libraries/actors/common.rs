@@ -34,3 +34,16 @@ pub struct QuoteRequest {
 #[message]
 #[derive(Clone, Debug)]
 pub struct RegisteredSignal;
+
+#[message]
+#[derive(Debug, Clone)]
+pub struct QuoteDetails {
+    pub ticker: String,
+    pub from: DateTime<Utc>,
+    pub to: DateTime<Utc>,
+    pub interval: chrono::Duration,
+}
+
+#[message]
+#[derive(Debug, Clone)]
+pub struct InitiateRequest;

@@ -4,22 +4,18 @@ use xactor::*;
 
 use crate::libraries::actors::common::RegisteredSignal;
 
-use super::{
-    data_persistor::DataPersistor, quote_processor::QuoteProcessor, quote_requester::QuoteRequester,
-};
+use super::{data_persistor::DataPersistor, quote_processor::QuoteProcessor};
 
 pub struct SignalHandler {
     signal_rx: channel::Receiver<()>,
     data_persistor_addr: Addr<DataPersistor>,
     quote_processor_addr: Addr<QuoteProcessor>,
-    quote_requester_addr: Addr<QuoteRequester>,
 }
 
 impl SignalHandler {
     pub fn new(
         data_persistor_addr: Addr<DataPersistor>,
         quote_processor_addr: Addr<QuoteProcessor>,
-        quote_requester_addr: Addr<QuoteRequester>,
     ) -> Self {
         let (signal_tx, signal_rx) = channel::bounded(100);
 
@@ -37,7 +33,6 @@ impl SignalHandler {
             signal_rx,
             data_persistor_addr,
             quote_processor_addr,
-            quote_requester_addr,
         }
     }
 }
@@ -57,10 +52,13 @@ impl Actor for SignalHandler {
             eprintln!("{}", e)
         }
         println!("SignalHandler:: Signal RegisteredSignal sending to QuoteProcessor.");
-        if let Err(e) = self.quote_requester_addr.send(RegisteredSignal) {
-            eprintln!("{}", e)
+        if let Err(e) = Broker::from_registry()
+            .await
+            .unwrap()
+            .publish(RegisteredSignal)
+        {
+            eprint!("{}", e);
         }
-        println!("SignalHandler:: Signal RegisteredSignal sending to QuoteRequester.");
         Ok(())
     }
 }

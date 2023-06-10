@@ -65,8 +65,8 @@ impl Handler<Quotes> for QuoteProcessor {
 
 #[async_trait::async_trait]
 impl Actor for QuoteProcessor {
-    async fn started(&mut self, _ctx: &mut Context<Self>) -> Result<()> {
-        Ok(())
+    async fn started(&mut self, ctx: &mut Context<Self>) -> Result<()> {
+        ctx.subscribe::<Quotes>().await
     }
 }
 

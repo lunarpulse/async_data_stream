@@ -32,12 +32,15 @@ impl QuoteMaker {
 
 #[async_trait::async_trait]
 impl Handler<InitiateRequest> for QuoteMaker {
-    async fn handle(&mut self, _ctx: &mut Context<Self>, _msg: InitiateRequest) {
+    async fn handle(&mut self, ctx: &mut Context<Self>, _msg: InitiateRequest) {
         let date_to = self.from + self.interval;
+        if date_to > self.to {
+            ctx.send_later(RegisteredSignal, Duration::from_micros(1));
+        }
         let request = QuoteRequest {
             symbol: self.ticker.clone(),
             from: self.from,
-            to: self.to,
+            to: date_to,
         };
         self.from = date_to;
         if let Err(e) = self.quote_requester_addr.send(request) {
